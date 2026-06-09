@@ -1,4 +1,5 @@
 use crate::audio::AudioEngine;
+use crate::config;
 use crate::decoder::{self, AudioData};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
@@ -29,6 +30,33 @@ impl Default for AppColors {
     }
 }
 
+impl From<&config::SavedColors> for AppColors {
+    fn from(s: &config::SavedColors) -> Self {
+        let c = |a: [u8; 4]| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3]);
+        AppColors {
+            background: c(s.background),
+            waveform: c(s.waveform),
+            playhead: c(s.playhead),
+            selection_fill: c(s.selection_fill),
+            selection_edge: c(s.selection_edge),
+            center_line: c(s.center_line),
+        }
+    }
+}
+
+impl From<&AppColors> for config::SavedColors {
+    fn from(c: &AppColors) -> Self {
+        config::SavedColors {
+            background: c.background.to_array(),
+            waveform: c.waveform.to_array(),
+            playhead: c.playhead.to_array(),
+            selection_fill: c.selection_fill.to_array(),
+            selection_edge: c.selection_edge.to_array(),
+            center_line: c.center_line.to_array(),
+        }
+    }
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -52,6 +80,9 @@ pub struct App {
 
     colors: AppColors,
     show_colors: bool,
+    saved_schemes: Vec<config::ColorScheme>,
+    new_scheme_name: String,
+    selected_scheme_idx: usize,
 
     status: String,
 }
@@ -61,6 +92,13 @@ impl App {
         let (engine, engine_error) = match AudioEngine::new() {
             Ok(e) => (Some(e), None),
             Err(e) => (None, Some(e.to_string())),
+        };
+        let cfg = config::load();
+        let colors = cfg.active_colors.as_ref().map(AppColors::from).unwrap_or_default();
+        let saved_schemes = if cfg.saved_schemes.is_empty() {
+            config::built_in_schemes()
+        } else {
+            cfg.saved_schemes
         };
         App {
             engine,
@@ -75,8 +113,11 @@ impl App {
             drag_anchor: None,
             speed: 1.0,
             volume: 1.0,
-            colors: AppColors::default(),
+            colors,
             show_colors: false,
+            saved_schemes,
+            new_scheme_name: String::new(),
+            selected_scheme_idx: 0,
             status: String::new(),
         }
     }
@@ -284,6 +325,14 @@ impl App {
             engine.state.lock().unwrap().volume = self.volume;
         }
     }
+
+    fn save_config(&self) {
+        let cfg = config::AppConfig {
+            active_colors: Some(config::SavedColors::from(&self.colors)),
+            saved_schemes: self.saved_schemes.clone(),
+        };
+        config::save(&cfg);
+    }
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -447,10 +496,75 @@ impl eframe::App for App {
 
         // ── Colors window ─────────────────────────────────────────────────────
         if self.show_colors {
+            let mut open = self.show_colors;
             egui::Window::new("Colors")
-                .open(&mut self.show_colors)
+                .open(&mut open)
                 .resizable(false)
+                .min_width(300.0)
                 .show(ctx, |ui| {
+                    ui.group(|ui| {
+                        ui.label("Schemes");
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_source("scheme_select")
+                                .width(160.0)
+                                .selected_text(
+                                    self.saved_schemes
+                                        .get(self.selected_scheme_idx)
+                                        .map_or("—", |s| s.name.as_str()),
+                                )
+                                .show_ui(ui, |ui: &mut egui::Ui| {
+                                    for i in 0..self.saved_schemes.len() {
+                                        let name = self.saved_schemes[i].name.clone();
+                                        ui.selectable_value(
+                                            &mut self.selected_scheme_idx,
+                                            i,
+                                            &name,
+                                        );
+                                    }
+                                });
+                            if ui.button("Apply").clicked() {
+                                if let Some(scheme) =
+                                    self.saved_schemes.get(self.selected_scheme_idx)
+                                {
+                                    self.colors = AppColors::from(&scheme.colors);
+                                    self.save_config();
+                                }
+                            }
+                            if ui.button("Delete").clicked() && !self.saved_schemes.is_empty() {
+                                self.saved_schemes.remove(self.selected_scheme_idx);
+                                if self.selected_scheme_idx > 0 {
+                                    self.selected_scheme_idx -= 1;
+                                }
+                                self.save_config();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Save as:");
+                            ui.add_sized(
+                                [120.0, 18.0],
+                                egui::TextEdit::singleline(&mut self.new_scheme_name),
+                            );
+                            let can_save = !self.new_scheme_name.trim().is_empty();
+                            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                                let name = self.new_scheme_name.trim().to_string();
+                                let colors = config::SavedColors::from(&self.colors);
+                                if let Some(existing) =
+                                    self.saved_schemes.iter_mut().find(|s| s.name == name)
+                                {
+                                    existing.colors = colors;
+                                } else {
+                                    self.saved_schemes
+                                        .push(config::ColorScheme { name, colors });
+                                    self.selected_scheme_idx = self.saved_schemes.len() - 1;
+                                }
+                                self.new_scheme_name.clear();
+                                self.save_config();
+                            }
+                        });
+                    });
+
+                    ui.add_space(4.0);
+
                     egui::Grid::new("color_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                         ui.label("Waveform");
                         ui.color_edit_button_srgba(&mut self.colors.waveform);
@@ -478,10 +592,16 @@ impl eframe::App for App {
                     });
 
                     ui.add_space(4.0);
-                    if ui.button("Reset to defaults").clicked() {
-                        self.colors = AppColors::default();
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset to defaults").clicked() {
+                            self.colors = AppColors::default();
+                        }
+                        if ui.button("Set as default").clicked() {
+                            self.save_config();
+                        }
+                    });
                 });
+            self.show_colors = open;
         }
 
         // ── Waveform panel ────────────────────────────────────────────────────

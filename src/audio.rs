@@ -93,6 +93,7 @@ pub struct PlaybackState {
     pub samples: Vec<f32>,
     pub channels: usize,
     pub speed: f64,
+    pub volume: f32,
     /// Display position (updated from OLA pos or simple-interp pos each callback).
     pub playback_pos: f64,
     pub is_playing: bool,
@@ -108,6 +109,7 @@ impl Default for PlaybackState {
             samples: Vec::new(),
             channels: 2,
             speed: 1.0,
+            volume: 1.0,
             playback_pos: 0.0,
             is_playing: false,
             loop_mode: false,
@@ -295,6 +297,13 @@ fn build_stream(
                 st.fill_simple(output, out_ch);
             } else {
                 st.fill_ola(output);
+            }
+
+            let vol = st.volume;
+            if (vol - 1.0).abs() > 1e-4 {
+                for s in output.iter_mut() {
+                    *s *= vol;
+                }
             }
         },
         |err| eprintln!("audio stream error: {err}"),

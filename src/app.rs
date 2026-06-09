@@ -3,7 +3,6 @@ use crate::decoder::{self, AudioData};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 const OVERVIEW_BUCKETS: usize = 8192;
-const WAVEFORM_HEIGHT: f32 = 380.0;
 
 // ── Color theme ───────────────────────────────────────────────────────────────
 
@@ -49,6 +48,7 @@ pub struct App {
     drag_anchor: Option<f64>,
 
     speed: f32,
+    volume: f32,
 
     colors: AppColors,
     show_colors: bool,
@@ -74,6 +74,7 @@ impl App {
             selection: None,
             drag_anchor: None,
             speed: 1.0,
+            volume: 1.0,
             colors: AppColors::default(),
             show_colors: false,
             status: String::new(),
@@ -277,6 +278,12 @@ impl App {
             engine.state.lock().unwrap().set_speed(self.speed as f64);
         }
     }
+
+    fn sync_volume(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.state.lock().unwrap().volume = self.volume;
+        }
+    }
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -381,6 +388,15 @@ impl eframe::App for App {
                     }
 
                     ui.add_space(16.0);
+                    ui.label("Volume:");
+                    let vol_label = format!("{:.0}%", self.volume * 100.0);
+                    let vol_slider = egui::Slider::new(&mut self.volume, 0.0_f32..=1.0_f32)
+                        .text(vol_label);
+                    if ui.add(vol_slider).changed() {
+                        self.sync_volume();
+                    }
+
+                    ui.add_space(16.0);
                     ui.label("Zoom:");
                     if ui.small_button("🔎+").clicked() {
                         let c = (self.view_start + self.view_end) * 0.5;
@@ -436,10 +452,6 @@ impl eframe::App for App {
                 .resizable(false)
                 .show(ctx, |ui| {
                     egui::Grid::new("color_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                        ui.label("Background");
-                        ui.color_edit_button_srgba(&mut self.colors.background);
-                        ui.end_row();
-
                         ui.label("Waveform");
                         ui.color_edit_button_srgba(&mut self.colors.waveform);
                         ui.end_row();
@@ -458,6 +470,10 @@ impl eframe::App for App {
 
                         ui.label("Center line");
                         ui.color_edit_button_srgba(&mut self.colors.center_line);
+                        ui.end_row();
+
+                        ui.label("Waveform background");
+                        ui.color_edit_button_srgba(&mut self.colors.background);
                         ui.end_row();
                     });
 
@@ -481,10 +497,7 @@ impl eframe::App for App {
 
 impl App {
     fn draw_waveform(&mut self, ui: &mut egui::Ui) {
-        let desired = Vec2::new(
-            ui.available_width(),
-            WAVEFORM_HEIGHT.min(ui.available_height()),
-        );
+        let desired = Vec2::new(ui.available_width(), ui.available_height());
         let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
 
         if !ui.is_rect_visible(rect) { return; }

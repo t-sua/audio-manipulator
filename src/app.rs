@@ -3,12 +3,33 @@ use crate::decoder::{self, AudioData};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 const OVERVIEW_BUCKETS: usize = 8192;
-const WAVEFORM_HEIGHT: f32 = 400.0;
-const BG_COLOR: Color32 = Color32::from_rgb(18, 18, 28);
-const WAVE_COLOR: Color32 = Color32::from_rgb(80, 200, 120);
-const SEL_FILL: Color32 = Color32::from_rgba_premultiplied(80, 140, 255, 45);
-const SEL_EDGE: Color32 = Color32::from_rgb(100, 160, 255);
-const PLAYHEAD_COLOR: Color32 = Color32::WHITE;
+
+// ── Color theme ───────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct AppColors {
+    pub background: Color32,
+    pub waveform: Color32,
+    pub playhead: Color32,
+    pub selection_fill: Color32,
+    pub selection_edge: Color32,
+    pub center_line: Color32,
+}
+
+impl Default for AppColors {
+    fn default() -> Self {
+        Self {
+            background: Color32::from_rgb(18, 18, 28),
+            waveform: Color32::from_rgb(80, 200, 120),
+            playhead: Color32::WHITE,
+            selection_fill: Color32::from_rgba_premultiplied(80, 140, 255, 45),
+            selection_edge: Color32::from_rgb(100, 160, 255),
+            center_line: Color32::from_rgb(40, 40, 60),
+        }
+    }
+}
+
+// ── App state ─────────────────────────────────────────────────────────────────
 
 pub struct App {
     engine: Option<AudioEngine>,
@@ -17,19 +38,21 @@ pub struct App {
     audio: Option<AudioData>,
     file_name: String,
 
-    /// Pre-computed overview min/max per bucket (mixed to mono).
     overview_min: Vec<f32>,
     overview_max: Vec<f32>,
 
-    /// Visible frame range.
     view_start: f64,
     view_end: f64,
 
-    /// Selection in frames.
     selection: Option<(f64, f64)>,
     drag_anchor: Option<f64>,
 
     speed: f32,
+    volume: f32,
+
+    colors: AppColors,
+    show_colors: bool,
+
     status: String,
 }
 
@@ -39,7 +62,6 @@ impl App {
             Ok(e) => (Some(e), None),
             Err(e) => (None, Some(e.to_string())),
         };
-
         App {
             engine,
             engine_error,
@@ -52,33 +74,35 @@ impl App {
             selection: None,
             drag_anchor: None,
             speed: 1.0,
+            volume: 1.0,
+            colors: AppColors::default(),
+            show_colors: false,
             status: String::new(),
         }
     }
 
+    // ── File loading ──────────────────────────────────────────────────────────
+
     fn load_file(&mut self, path: &std::path::Path) {
-        let path_str = path.to_string_lossy().to_string();
-        match decoder::decode_file(&path_str) {
-            Err(e) => {
-                self.status = format!("Error loading file: {e}");
-            }
+        match decoder::decode_file(&path.to_string_lossy()) {
+            Err(e) => self.status = format!("Error: {e}"),
             Ok(raw) => {
-                let target_rate = self
+                let target = self
                     .engine
                     .as_ref()
                     .map(|e| e.output_sample_rate)
                     .unwrap_or(raw.sample_rate);
 
-                let audio = if raw.sample_rate != target_rate {
-                    decoder::resample(&raw, target_rate)
+                let audio = if raw.sample_rate != target {
+                    decoder::resample(&raw, target)
                 } else {
                     raw
                 };
 
-                let total_frames = audio.total_frames();
+                let total = audio.total_frames();
                 self.compute_overview(&audio);
                 self.view_start = 0.0;
-                self.view_end = total_frames as f64;
+                self.view_end = total as f64;
                 self.selection = None;
 
                 self.file_name = path
@@ -99,7 +123,7 @@ impl App {
                     let mut st = engine.state.lock().unwrap();
                     st.samples = audio.samples.clone();
                     st.channels = audio.channels;
-                    st.playback_pos = 0.0;
+                    st.seek_to(0.0);
                     st.is_playing = false;
                     st.selection = None;
                 }
@@ -109,114 +133,73 @@ impl App {
         }
     }
 
+    // ── Overview ──────────────────────────────────────────────────────────────
+
     fn compute_overview(&mut self, audio: &AudioData) {
-        let total_frames = audio.total_frames();
-        if total_frames == 0 {
+        let total = audio.total_frames();
+        if total == 0 {
             self.overview_min.clear();
             self.overview_max.clear();
             return;
         }
-
-        let buckets = OVERVIEW_BUCKETS.min(total_frames);
+        let buckets = OVERVIEW_BUCKETS.min(total);
         let mut mins = vec![f32::MAX; buckets];
         let mut maxs = vec![f32::MIN; buckets];
         let ch = audio.channels;
 
-        for frame in 0..total_frames {
-            let b = (frame as f64 * buckets as f64 / total_frames as f64) as usize;
-            let b = b.min(buckets - 1);
-
+        for frame in 0..total {
+            let b = ((frame as f64 * buckets as f64 / total as f64) as usize).min(buckets - 1);
             let mut sum = 0.0f32;
             for c in 0..ch {
                 sum += audio.samples[frame * ch + c];
             }
             let avg = sum / ch as f32;
-
-            if avg < mins[b] {
-                mins[b] = avg;
-            }
-            if avg > maxs[b] {
-                maxs[b] = avg;
-            }
+            if avg < mins[b] { mins[b] = avg; }
+            if avg > maxs[b] { maxs[b] = avg; }
         }
-
         for i in 0..buckets {
-            if mins[i] == f32::MAX {
-                mins[i] = 0.0;
-            }
-            if maxs[i] == f32::MIN {
-                maxs[i] = 0.0;
-            }
+            if mins[i] == f32::MAX { mins[i] = 0.0; }
+            if maxs[i] == f32::MIN { maxs[i] = 0.0; }
         }
-
         self.overview_min = mins;
         self.overview_max = maxs;
     }
 
-    fn waveform_min_max(&self, frame_start: f64, frame_end: f64) -> (f32, f32) {
-        let audio = match &self.audio {
-            Some(a) => a,
-            None => return (0.0, 0.0),
-        };
-
+    fn waveform_min_max(&self, fs: f64, fe: f64) -> (f32, f32) {
+        let audio = match &self.audio { Some(a) => a, None => return (0.0, 0.0) };
         let total = audio.total_frames();
-        if total == 0 {
-            return (0.0, 0.0);
-        }
+        if total == 0 { return (0.0, 0.0); }
 
-        let frames_span = frame_end - frame_start;
         let ob = self.overview_min.len();
 
-        if frames_span >= 1.0 && ob > 0 {
-            let b0 = ((frame_start / total as f64) * ob as f64) as usize;
-            let b1 = (((frame_end / total as f64) * ob as f64) as usize + 1).min(ob);
+        if fe - fs >= 1.0 && ob > 0 {
+            let b0 = ((fs / total as f64) * ob as f64) as usize;
+            let b1 = (((fe / total as f64) * ob as f64) as usize + 1).min(ob);
             let b0 = b0.min(ob - 1);
-
-            let mut mn = f32::MAX;
-            let mut mx = f32::MIN;
+            let (mut mn, mut mx) = (f32::MAX, f32::MIN);
             for b in b0..b1 {
-                if self.overview_min[b] < mn {
-                    mn = self.overview_min[b];
-                }
-                if self.overview_max[b] > mx {
-                    mx = self.overview_max[b];
-                }
+                if self.overview_min[b] < mn { mn = self.overview_min[b]; }
+                if self.overview_max[b] > mx { mx = self.overview_max[b]; }
             }
-            (
-                if mn == f32::MAX { 0.0 } else { mn },
-                if mx == f32::MIN { 0.0 } else { mx },
-            )
+            (if mn == f32::MAX { 0.0 } else { mn }, if mx == f32::MIN { 0.0 } else { mx })
         } else {
-            let i0 = (frame_start as usize).min(total);
-            let i1 = (frame_end.ceil() as usize + 1).min(total);
             let ch = audio.channels;
-
-            let mut mn = f32::MAX;
-            let mut mx = f32::MIN;
-
+            let i0 = (fs as usize).min(total);
+            let i1 = (fe.ceil() as usize + 1).min(total);
+            let (mut mn, mut mx) = (f32::MAX, f32::MIN);
             for frame in i0..i1 {
-                if frame >= total {
-                    break;
-                }
+                if frame >= total { break; }
                 let mut sum = 0.0f32;
-                for c in 0..ch {
-                    sum += audio.samples[frame * ch + c];
-                }
+                for c in 0..ch { sum += audio.samples[frame * ch + c]; }
                 let avg = sum / ch as f32;
-                if avg < mn {
-                    mn = avg;
-                }
-                if avg > mx {
-                    mx = avg;
-                }
+                if avg < mn { mn = avg; }
+                if avg > mx { mx = avg; }
             }
-
-            (
-                if mn == f32::MAX { 0.0 } else { mn },
-                if mx == f32::MIN { 0.0 } else { mx },
-            )
+            (if mn == f32::MAX { 0.0 } else { mn }, if mx == f32::MIN { 0.0 } else { mx })
         }
     }
+
+    // ── View helpers ──────────────────────────────────────────────────────────
 
     fn frame_to_x(&self, frame: f64, rect: Rect) -> f32 {
         let span = (self.view_end - self.view_start).max(1.0);
@@ -228,49 +211,34 @@ impl App {
         self.view_start + t * (self.view_end - self.view_start)
     }
 
-    fn zoom(&mut self, factor: f64, center_frame: f64) {
-        let total = self
-            .audio
-            .as_ref()
-            .map(|a| a.total_frames() as f64)
-            .unwrap_or(1.0);
-
-        let span = (self.view_end - self.view_start) * factor;
-        let span = span.clamp(100.0, total);
-
-        self.view_start = (center_frame - span * 0.5).max(0.0);
+    fn zoom(&mut self, factor: f64, center: f64) {
+        let total = self.audio.as_ref().map(|a| a.total_frames() as f64).unwrap_or(1.0);
+        let span = ((self.view_end - self.view_start) * factor).clamp(100.0, total);
+        self.view_start = (center - span * 0.5).max(0.0);
         self.view_end = (self.view_start + span).min(total);
-        if self.view_end == total {
-            self.view_start = (total - span).max(0.0);
-        }
+        if self.view_end == total { self.view_start = (total - span).max(0.0); }
     }
 
+    // ── Engine accessors ──────────────────────────────────────────────────────
+
     fn playback_pos(&self) -> f64 {
-        self.engine
-            .as_ref()
-            .map(|e| e.state.lock().unwrap().playback_pos)
-            .unwrap_or(0.0)
+        self.engine.as_ref().map(|e| e.state.lock().unwrap().playback_pos).unwrap_or(0.0)
     }
 
     fn is_playing(&self) -> bool {
-        self.engine
-            .as_ref()
-            .map(|e| e.state.lock().unwrap().is_playing)
-            .unwrap_or(false)
+        self.engine.as_ref().map(|e| e.state.lock().unwrap().is_playing).unwrap_or(false)
     }
 
     fn toggle_play(&mut self) {
         if let Some(engine) = &self.engine {
             let mut st = engine.state.lock().unwrap();
-            if st.samples.is_empty() {
-                return;
-            }
+            if st.samples.is_empty() { return; }
             if st.is_playing {
                 st.is_playing = false;
             } else {
                 let (start, end) = st.play_range();
                 if st.playback_pos >= end || st.playback_pos < start {
-                    st.playback_pos = start;
+                    st.seek_to(start);
                 }
                 st.is_playing = true;
             }
@@ -285,183 +253,262 @@ impl App {
         }
     }
 
-    fn sync_selection_to_engine(&mut self) {
+    fn play_from_beginning(&mut self) {
         if let Some(engine) = &self.engine {
             let mut st = engine.state.lock().unwrap();
-            st.selection = self.selection;
+            if st.samples.is_empty() { return; }
+            st.seek_to(0.0);
+            st.is_playing = true;
         }
     }
 
-    fn sync_speed_to_engine(&mut self) {
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.sync_selection();
+    }
+
+    fn sync_selection(&mut self) {
         if let Some(engine) = &self.engine {
-            let mut st = engine.state.lock().unwrap();
-            st.speed = self.speed as f64;
+            engine.state.lock().unwrap().selection = self.selection;
+        }
+    }
+
+    fn sync_speed(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.state.lock().unwrap().set_speed(self.speed as f64);
+        }
+    }
+
+    fn sync_volume(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.state.lock().unwrap().volume = self.volume;
         }
     }
 }
 
+// ── eframe::App ───────────────────────────────────────────────────────────────
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Request continuous repaint while playing so playhead moves.
-        if self.is_playing() {
-            ctx.request_repaint();
+        if self.is_playing() { ctx.request_repaint(); }
+
+        // Spacebar → toggle play/pause (consumed so it doesn't reach text fields)
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            self.toggle_play();
         }
 
+        // ── Top bar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open File…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "Audio",
-                            &["mp3", "flac", "wav", "ogg", "aac", "m4a", "opus"],
-                        )
+                        .add_filter("Audio", &["mp3", "flac", "wav", "ogg", "aac", "m4a", "opus"])
                         .pick_file()
                     {
                         self.load_file(&path);
                     }
                 }
-
-                if !self.file_name.is_empty() {
-                    ui.label(&self.file_name);
-                }
-
+                if !self.file_name.is_empty() { ui.label(&self.file_name); }
                 if let Some(err) = &self.engine_error {
-                    ui.colored_label(Color32::RED, format!("Audio engine error: {err}"));
+                    ui.colored_label(Color32::RED, format!("Audio error: {err}"));
                 }
             });
         });
 
-        egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
-            ui.add_space(4.0);
+        // ── Bottom controls ───────────────────────────────────────────────────
+        egui::TopBottomPanel::bottom("controls")
+            .min_height(110.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
 
-            // Transport row
-            ui.horizontal(|ui| {
-                let playing = self.is_playing();
+                // Transport buttons — larger, centered
+                ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
 
-                let play_label = if playing { "⏸ Pause" } else { "▶ Play" };
-                if ui.button(play_label).clicked() {
-                    self.toggle_play();
-                }
-
-                if ui.button("⏹ Stop").clicked() {
-                    self.stop();
-                }
-
-                let loop_mode = self
-                    .engine
-                    .as_ref()
-                    .map(|e| e.state.lock().unwrap().loop_mode)
-                    .unwrap_or(false);
-
-                let mut lm = loop_mode;
-                if ui.checkbox(&mut lm, "Loop").changed() {
-                    if let Some(engine) = &self.engine {
-                        engine.state.lock().unwrap().loop_mode = lm;
-                    }
-                }
-
-                // Time display
-                if let Some(audio) = &self.audio {
-                    let pos_secs = self.playback_pos() / audio.sample_rate as f64;
-                    let total_secs = audio.duration_secs();
-                    ui.label(format!(
-                        "{} / {}",
-                        fmt_time(pos_secs),
-                        fmt_time(total_secs)
-                    ));
-                }
-            });
-
-            ui.add_space(4.0);
-
-            // Speed row
-            ui.horizontal(|ui| {
-                ui.label("Speed:");
-                let old_speed = self.speed;
-                let speed_label = format!("{:.2}×", self.speed);
-                let slider = egui::Slider::new(&mut self.speed, 0.05_f32..=2.0_f32)
-                    .logarithmic(true)
-                    .text(speed_label);
-                if ui.add(slider).changed() || (self.speed - old_speed).abs() > 1e-5 {
-                    self.sync_speed_to_engine();
-                }
-
-                if ui.button("Reset").clicked() {
-                    self.speed = 1.0;
-                    self.sync_speed_to_engine();
-                }
-
-                ui.add_space(16.0);
-
-                // Zoom controls
-                ui.label("Zoom:");
-                if ui.button("🔎+").clicked() {
-                    let c = (self.view_start + self.view_end) * 0.5;
-                    self.zoom(0.5, c);
-                }
-                if ui.button("🔎-").clicked() {
-                    let c = (self.view_start + self.view_end) * 0.5;
-                    self.zoom(2.0, c);
-                }
-                if ui.button("Fit").clicked() {
-                    if let Some(audio) = &self.audio {
-                        self.view_start = 0.0;
-                        self.view_end = audio.total_frames() as f64;
-                    }
-                }
-
-                if ui.button("Sel→View").clicked() {
-                    if let Some((s, e)) = self.selection {
-                        let pad = (e - s) * 0.05;
-                        self.view_start = (s - pad).max(0.0);
-                        self.view_end = if let Some(audio) = &self.audio {
-                            (e + pad).min(audio.total_frames() as f64)
-                        } else {
-                            e + pad
+                        let btn = |label: &str| {
+                            egui::Button::new(
+                                egui::RichText::new(label).size(16.0)
+                            )
                         };
+                        let bsz = Vec2::new(110.0, 40.0);
+
+                        if ui.add_sized(bsz, btn("⏮  Start")).clicked() {
+                            self.play_from_beginning();
+                        }
+
+                        let play_label = if self.is_playing() { "⏸  Pause" } else { "▶  Play" };
+                        if ui.add_sized(bsz, btn(play_label)).clicked() {
+                            self.toggle_play();
+                        }
+
+                        if ui.add_sized(bsz, btn("⏹  Stop")).clicked() {
+                            self.stop();
+                        }
+
+                        let loop_mode = self.engine.as_ref()
+                            .map(|e| e.state.lock().unwrap().loop_mode)
+                            .unwrap_or(false);
+                        let mut lm = loop_mode;
+                        let loop_btn = egui::Button::new(
+                            egui::RichText::new(if lm { "🔁  Loop ON" } else { "🔁  Loop OFF" }).size(16.0)
+                        );
+                        if ui.add_sized(bsz, loop_btn).clicked() {
+                            lm = !lm;
+                            if let Some(engine) = &self.engine {
+                                engine.state.lock().unwrap().loop_mode = lm;
+                            }
+                        }
+
+                        if ui.add_sized(bsz, btn("✕  Deselect")).clicked() {
+                            self.clear_selection();
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Speed, zoom, colors row
+                ui.horizontal(|ui| {
+                    ui.label("Speed:");
+                    let old = self.speed;
+                    let speed_label = format!("{:.2}×", self.speed);
+                    let slider = egui::Slider::new(&mut self.speed, 0.05_f32..=2.0_f32)
+                        .logarithmic(true)
+                        .text(speed_label)
+                        .min_decimals(2);
+                    if ui.add(slider).changed() || (self.speed - old).abs() > 1e-5 {
+                        self.sync_speed();
                     }
+                    if ui.small_button("1×").clicked() {
+                        self.speed = 1.0;
+                        self.sync_speed();
+                    }
+
+                    ui.add_space(16.0);
+                    ui.label("Volume:");
+                    let vol_label = format!("{:.0}%", self.volume * 100.0);
+                    let vol_slider = egui::Slider::new(&mut self.volume, 0.0_f32..=1.0_f32)
+                        .text(vol_label);
+                    if ui.add(vol_slider).changed() {
+                        self.sync_volume();
+                    }
+
+                    ui.add_space(16.0);
+                    ui.label("Zoom:");
+                    if ui.small_button("🔎+").clicked() {
+                        let c = (self.view_start + self.view_end) * 0.5;
+                        self.zoom(0.5, c);
+                    }
+                    if ui.small_button("🔎-").clicked() {
+                        let c = (self.view_start + self.view_end) * 0.5;
+                        self.zoom(2.0, c);
+                    }
+                    if ui.small_button("Fit").clicked() {
+                        if let Some(a) = &self.audio {
+                            self.view_start = 0.0;
+                            self.view_end = a.total_frames() as f64;
+                        }
+                    }
+                    if ui.small_button("Sel→View").clicked() {
+                        if let Some((s, e)) = self.selection {
+                            let pad = (e - s) * 0.05;
+                            self.view_start = (s - pad).max(0.0);
+                            self.view_end = if let Some(a) = &self.audio {
+                                (e + pad).min(a.total_frames() as f64)
+                            } else { e + pad };
+                        }
+                    }
+
+                    ui.add_space(16.0);
+                    if ui.small_button("🎨 Colors…").clicked() {
+                        self.show_colors = !self.show_colors;
+                    }
+
+                    // Time display (right-aligned by filling remaining space)
+                    if let Some(audio) = &self.audio {
+                        let pos_s = self.playback_pos() / audio.sample_rate as f64;
+                        let tot_s = audio.duration_secs();
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(format!("{} / {}", fmt_time(pos_s), fmt_time(tot_s)));
+                        });
+                    }
+                });
+
+                if !self.status.is_empty() {
+                    ui.add_space(2.0);
+                    ui.label(&self.status);
                 }
+
+                ui.add_space(4.0);
             });
 
-            ui.add_space(2.0);
+        // ── Colors window ─────────────────────────────────────────────────────
+        if self.show_colors {
+            egui::Window::new("Colors")
+                .open(&mut self.show_colors)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::Grid::new("color_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("Waveform");
+                        ui.color_edit_button_srgba(&mut self.colors.waveform);
+                        ui.end_row();
 
-            if !self.status.is_empty() {
-                ui.label(&self.status);
-            }
+                        ui.label("Playhead");
+                        ui.color_edit_button_srgba(&mut self.colors.playhead);
+                        ui.end_row();
 
-            ui.add_space(4.0);
-        });
+                        ui.label("Selection fill");
+                        ui.color_edit_button_srgba(&mut self.colors.selection_fill);
+                        ui.end_row();
 
+                        ui.label("Selection edge");
+                        ui.color_edit_button_srgba(&mut self.colors.selection_edge);
+                        ui.end_row();
+
+                        ui.label("Center line");
+                        ui.color_edit_button_srgba(&mut self.colors.center_line);
+                        ui.end_row();
+
+                        ui.label("Waveform background");
+                        ui.color_edit_button_srgba(&mut self.colors.background);
+                        ui.end_row();
+                    });
+
+                    ui.add_space(4.0);
+                    if ui.button("Reset to defaults").clicked() {
+                        self.colors = AppColors::default();
+                    }
+                });
+        }
+
+        // ── Waveform panel ────────────────────────────────────────────────────
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG_COLOR))
+            .frame(egui::Frame::none().fill(self.colors.background))
             .show(ctx, |ui| {
                 self.draw_waveform(ui);
             });
     }
 }
 
+// ── Waveform ──────────────────────────────────────────────────────────────────
+
 impl App {
     fn draw_waveform(&mut self, ui: &mut egui::Ui) {
-        let desired = Vec2::new(ui.available_width(), WAVEFORM_HEIGHT.min(ui.available_height()));
-        let (rect, response) =
-            ui.allocate_exact_size(desired, Sense::click_and_drag());
+        let desired = Vec2::new(ui.available_width(), ui.available_height());
+        let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
 
-        if !ui.is_rect_visible(rect) {
-            return;
-        }
+        if !ui.is_rect_visible(rect) { return; }
 
         let painter = ui.painter_at(rect);
-
-        // Background
-        painter.rect_filled(rect, 0.0, BG_COLOR);
+        painter.rect_filled(rect, 0.0, self.colors.background);
 
         // Center line
         painter.line_segment(
-            [
-                Pos2::new(rect.left(), rect.center().y),
-                Pos2::new(rect.right(), rect.center().y),
-            ],
-            Stroke::new(1.0, Color32::from_rgb(40, 40, 60)),
+            [Pos2::new(rect.left(), rect.center().y), Pos2::new(rect.right(), rect.center().y)],
+            Stroke::new(1.0, self.colors.center_line),
         );
 
         if self.audio.is_none() {
@@ -475,139 +522,112 @@ impl App {
             return;
         }
 
-        let total_frames = self.audio.as_ref().unwrap().total_frames() as f64;
+        let total = self.audio.as_ref().unwrap().total_frames() as f64;
         let width = rect.width() as usize;
         let span = (self.view_end - self.view_start).max(1.0);
 
-        // Draw waveform columns
+        // Waveform columns
         for px in 0..width {
             let fs = self.view_start + (px as f64 / width as f64) * span;
             let fe = self.view_start + ((px + 1) as f64 / width as f64) * span;
-
             let (mn, mx) = self.waveform_min_max(fs, fe);
 
             let x = rect.left() + px as f32;
             let mid = rect.center().y;
-            let half_h = rect.height() * 0.5;
-
-            let y_top = (mid - mx * half_h).clamp(rect.top(), rect.bottom());
-            let y_bot = (mid - mn * half_h).clamp(rect.top(), rect.bottom());
+            let hh = rect.height() * 0.5;
+            let y_top = (mid - mx * hh).clamp(rect.top(), rect.bottom());
+            let y_bot = (mid - mn * hh).clamp(rect.top(), rect.bottom());
 
             painter.line_segment(
                 [Pos2::new(x, y_top), Pos2::new(x, y_bot)],
-                Stroke::new(1.0, WAVE_COLOR),
+                Stroke::new(1.0, self.colors.waveform),
             );
         }
 
         // Selection overlay
-        if let Some((sel_s, sel_e)) = self.selection {
-            let x0 = self.frame_to_x(sel_s, rect).clamp(rect.left(), rect.right());
-            let x1 = self.frame_to_x(sel_e, rect).clamp(rect.left(), rect.right());
-
+        if let Some((s, e)) = self.selection {
+            let x0 = self.frame_to_x(s, rect).clamp(rect.left(), rect.right());
+            let x1 = self.frame_to_x(e, rect).clamp(rect.left(), rect.right());
             if x1 > x0 {
-                let sel_rect = Rect::from_min_max(
-                    Pos2::new(x0, rect.top()),
-                    Pos2::new(x1, rect.bottom()),
-                );
-                painter.rect_filled(sel_rect, 0.0, SEL_FILL);
-                painter.rect_stroke(sel_rect, 0.0, Stroke::new(1.0, SEL_EDGE));
+                let sr = Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.bottom()));
+                painter.rect_filled(sr, 0.0, self.colors.selection_fill);
+                painter.rect_stroke(sr, 0.0, Stroke::new(1.0, self.colors.selection_edge));
             }
         }
 
         // Playhead
-        let pos = self.playback_pos();
-        let ph_x = self.frame_to_x(pos, rect);
-        if ph_x >= rect.left() && ph_x <= rect.right() {
+        let ph = self.frame_to_x(self.playback_pos(), rect);
+        if ph >= rect.left() && ph <= rect.right() {
             painter.line_segment(
-                [Pos2::new(ph_x, rect.top()), Pos2::new(ph_x, rect.bottom())],
-                Stroke::new(2.0, PLAYHEAD_COLOR),
+                [Pos2::new(ph, rect.top()), Pos2::new(ph, rect.bottom())],
+                Stroke::new(2.0, self.colors.playhead),
             );
         }
 
-        // --- Interactions ---
+        // ── Interactions ──────────────────────────────────────────────────────
 
-        // Scroll to pan, Ctrl+scroll to zoom
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta);
-        if rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
+        // Ctrl+scroll → zoom; plain scroll → pan
+        let hover = ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+        if rect.contains(hover) {
             let ctrl = ui.input(|i| i.modifiers.ctrl);
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
 
-            if ctrl && scroll_delta.y.abs() > 0.0 {
-                let hover_frame = ui
-                    .input(|i| i.pointer.hover_pos())
+            if ctrl && scroll.y.abs() > 0.0 {
+                let cf = ui.input(|i| i.pointer.hover_pos())
                     .map(|p| self.x_to_frame(p.x, rect))
                     .unwrap_or((self.view_start + self.view_end) * 0.5);
-
-                let factor = if scroll_delta.y > 0.0 { 0.8 } else { 1.25 };
-                self.zoom(factor, hover_frame);
-            } else if scroll_delta.x.abs() > 0.0 || (!ctrl && scroll_delta.y.abs() > 0.0) {
-                let delta_px = if scroll_delta.x.abs() > 0.0 {
-                    scroll_delta.x
-                } else {
-                    -scroll_delta.y
-                };
-                let delta_frames = (delta_px as f64 / rect.width() as f64) * span;
-                let max_start = (total_frames - span).max(0.0);
-                self.view_start = (self.view_start + delta_frames).clamp(0.0, max_start);
+                let f = if scroll.y > 0.0 { 0.8 } else { 1.25 };
+                self.zoom(f, cf);
+            } else if scroll.x.abs() > 0.0 || (!ctrl && scroll.y.abs() > 0.0) {
+                let delta = if scroll.x.abs() > 0.0 { scroll.x } else { -scroll.y };
+                let delta_f = (delta as f64 / rect.width() as f64) * span;
+                let max_s = (total - span).max(0.0);
+                self.view_start = (self.view_start + delta_f).clamp(0.0, max_s);
                 self.view_end = self.view_start + span;
             }
         }
 
-        // Pinch-to-zoom
-        let zoom_delta = ui.input(|i| i.zoom_delta());
-        if zoom_delta != 1.0 {
-            let center = ui
-                .input(|i| i.pointer.hover_pos())
+        // Pinch zoom
+        let zd = ui.input(|i| i.zoom_delta());
+        if zd != 1.0 {
+            let cf = ui.input(|i| i.pointer.hover_pos())
                 .map(|p| self.x_to_frame(p.x, rect))
                 .unwrap_or((self.view_start + self.view_end) * 0.5);
-            self.zoom(1.0 / zoom_delta as f64, center);
+            self.zoom(1.0 / zd as f64, cf);
         }
 
-        // Click / drag for selection
+        // Drag → selection
         if response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let f = self.x_to_frame(pos.x, rect);
-                self.drag_anchor = Some(f);
+            if let Some(p) = response.interact_pointer_pos() {
+                self.drag_anchor = Some(self.x_to_frame(p.x, rect));
                 self.selection = None;
-                self.sync_selection_to_engine();
+                self.sync_selection();
             }
         }
-
         if response.dragged() {
-            if let (Some(anchor), Some(pos)) = (self.drag_anchor, response.interact_pointer_pos())
-            {
-                let f = self.x_to_frame(pos.x, rect);
+            if let (Some(anchor), Some(p)) = (self.drag_anchor, response.interact_pointer_pos()) {
+                let f = self.x_to_frame(p.x, rect);
                 let (s, e) = if f < anchor { (f, anchor) } else { (anchor, f) };
-                let total = total_frames;
                 self.selection = Some((s.max(0.0), e.min(total)));
-                self.sync_selection_to_engine();
+                self.sync_selection();
             }
         }
-
         if response.drag_stopped() {
-            // Keep selection but clear anchor
             self.drag_anchor = None;
-            // If tiny selection (< 10 frames), clear it
             if let Some((s, e)) = self.selection {
-                if (e - s) < 10.0 {
-                    self.selection = None;
-                    self.sync_selection_to_engine();
-                }
+                if e - s < 10.0 { self.clear_selection(); }
             }
         }
 
-        // Double-click clears selection
-        if response.double_clicked() {
-            self.selection = None;
-            self.sync_selection_to_engine();
-        }
+        // Double-click → clear selection
+        if response.double_clicked() { self.clear_selection(); }
 
-        // Click without drag: seek playhead
+        // Single click (no drag) → seek
         if response.clicked() && self.drag_anchor.is_none() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let f = self.x_to_frame(pos.x, rect);
+            if let Some(p) = response.interact_pointer_pos() {
+                let f = self.x_to_frame(p.x, rect).clamp(0.0, total);
                 if let Some(engine) = &self.engine {
-                    let mut st = engine.state.lock().unwrap();
-                    st.playback_pos = f.clamp(0.0, total_frames);
+                    engine.state.lock().unwrap().seek_to(f);
                 }
             }
         }
@@ -617,7 +637,6 @@ impl App {
 fn fmt_time(secs: f64) -> String {
     let s = secs as u64;
     let ms = ((secs - s as f64) * 100.0) as u64;
-    let m = s / 60;
-    let s = s % 60;
+    let (m, s) = (s / 60, s % 60);
     format!("{m}:{s:02}.{ms:02}")
 }

@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod config;
 mod decoder;
 
 fn main() -> eframe::Result {

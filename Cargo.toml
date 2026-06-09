@@ -13,4 +13,9 @@ egui = "0.28"
 cpal = "0.15"
 symphonia = { version = "0.5", features = ["all"] }
 anyhow = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "0.14", default-features = false }

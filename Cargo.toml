@@ -1,0 +1,16 @@
+[package]
+name = "audio-manipulator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "audio-manipulator"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+cpal = "0.15"
+symphonia = { version = "0.5", features = ["all"] }
+anyhow = "1.0"
+rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "async-std"] }
